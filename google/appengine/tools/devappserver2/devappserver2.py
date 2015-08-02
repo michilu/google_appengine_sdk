@@ -423,6 +423,17 @@ def create_command_line_parser():
       'an instance of the app. May be specified more than once. Example: '
       '--jvm_flag=-Xmx1024m --jvm_flag=-Xms256m')
 
+  # Custom
+  custom_group = parser.add_argument_group('Custom VM Runtime')
+  custom_group.add_argument(
+      '--custom_entrypoint',
+      help='specify an entrypoint for custom runtime modules. This is '
+      'required when such modules are present. Include "{port}" in the '
+      'string (without quotes) to pass the port number in as an argument. For '
+      'instance: --custom_entrypoint="gunicorn -b localhost:{port} '
+      'mymodule:application"',
+      default='')
+
   # Blobstore
   blobstore_group = parser.add_argument_group('Blobstore API')
   blobstore_group.add_argument(
@@ -772,6 +783,7 @@ class DevelopmentServer(object):
         self._create_php_config(options),
         self._create_python_config(options),
         self._create_java_config(options),
+        self._create_custom_config(options),
         self._create_cloud_sql_config(options),
         self._create_vm_config(options),
         self._create_module_to_setting(options.max_module_instances,
@@ -928,6 +940,12 @@ class DevelopmentServer(object):
     if options.jvm_flag:
       java_config.jvm_args.extend(options.jvm_flag)
     return java_config
+
+  @staticmethod
+  def _create_custom_config(options):
+    custom_config = runtime_config_pb2.CustomConfig()
+    custom_config.custom_entrypoint = options.custom_entrypoint
+    return custom_config
 
   @staticmethod
   def _create_cloud_sql_config(options):

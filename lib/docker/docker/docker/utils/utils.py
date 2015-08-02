@@ -28,6 +28,7 @@ import six
 
 from .. import errors
 from .. import tls
+from .types import Ulimit, LogConfig
 
 
 DEFAULT_HTTP_HOST = "127.0.0.1"
@@ -116,6 +117,10 @@ def compare_version(v1, v2):
         return -1
     else:
         return 1
+
+
+def ping_registry(url):
+    return ping(url + '/v2/') or ping(url + '/v1/_ping')
 
 
 def ping(url):
@@ -353,7 +358,8 @@ def create_host_config(
     publish_all_ports=False, links=None, privileged=False,
     dns=None, dns_search=None, volumes_from=None, network_mode=None,
     restart_policy=None, cap_add=None, cap_drop=None, devices=None,
-    extra_hosts=None, read_only=None, pid_mode=None, security_opt=None
+    extra_hosts=None, read_only=None, pid_mode=None, ipc_mode=None,
+    security_opt=None, ulimits=None, log_config=None
 ):
     host_config = {}
 
@@ -363,6 +369,9 @@ def create_host_config(
         )
     elif pid_mode:
         host_config['PidMode'] = pid_mode
+
+    if ipc_mode:
+        host_config['IpcMode'] = ipc_mode
 
     if privileged:
         host_config['Privileged'] = privileged
@@ -395,6 +404,11 @@ def create_host_config(
         host_config['Dns'] = dns
 
     if security_opt is not None:
+        if not isinstance(security_opt, list):
+            raise errors.DockerException(
+                'Invalid type for security_opt param: expected list but found'
+                ' {0}'.format(type(security_opt))
+            )
         host_config['SecurityOpt'] = security_opt
 
     if volumes_from is not None:
@@ -438,6 +452,28 @@ def create_host_config(
     if lxc_conf is not None:
         host_config['LxcConf'] = lxc_conf
 
+    if ulimits is not None:
+        if not isinstance(ulimits, list):
+            raise errors.DockerException(
+                'Invalid type for ulimits param: expected list but found'
+                ' {0}'.format(type(ulimits))
+            )
+        host_config['Ulimits'] = []
+        for l in ulimits:
+            if not isinstance(l, Ulimit):
+                l = Ulimit(**l)
+            host_config['Ulimits'].append(l)
+
+    if log_config is not None:
+        if not isinstance(log_config, LogConfig):
+            if not isinstance(log_config, dict):
+                raise errors.DockerException(
+                    'Invalid type for log_config param: expected LogConfig but'
+                    ' found {0}'.format(type(log_config))
+                )
+            log_config = LogConfig(**log_config)
+        host_config['LogConfig'] = log_config
+
     return host_config
 
 
@@ -447,7 +483,7 @@ def create_container_config(
     dns=None, volumes=None, volumes_from=None, network_disabled=False,
     entrypoint=None, cpu_shares=None, working_dir=None, domainname=None,
     memswap_limit=0, cpuset=None, host_config=None, mac_address=None,
-    labels=None, security_opt=None
+    labels=None
 ):
     if isinstance(command, six.string_types):
         command = shlex.split(str(command))
@@ -546,5 +582,4 @@ def create_container_config(
         'HostConfig': host_config,
         'MacAddress': mac_address,
         'Labels': labels,
-        'SecurityOpt': security_opt,
     }

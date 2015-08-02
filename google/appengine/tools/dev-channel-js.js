@@ -293,6 +293,15 @@ goog.normalizePath_ = function(path) {
   }
   return components.join("/");
 };
+goog.loadFileSync_ = function(src) {
+  if (goog.global.CLOSURE_LOAD_FILE_SYNC) {
+    return goog.global.CLOSURE_LOAD_FILE_SYNC(src);
+  }
+  var xhr = new goog.global.XMLHttpRequest;
+  xhr.open("get", src, !1);
+  xhr.send();
+  return xhr.responseText;
+};
 goog.retrieveAndExecModule_ = function() {
 };
 goog.typeOf = function(value) {
@@ -1741,7 +1750,7 @@ goog.i18n.bidi.toDir = function(givenDir, opt_noNeutral) {
   return "number" == typeof givenDir ? 0 < givenDir ? goog.i18n.bidi.Dir.LTR : 0 > givenDir ? goog.i18n.bidi.Dir.RTL : opt_noNeutral ? null : goog.i18n.bidi.Dir.NEUTRAL : null == givenDir ? null : givenDir ? goog.i18n.bidi.Dir.RTL : goog.i18n.bidi.Dir.LTR;
 };
 goog.i18n.bidi.ltrChars_ = "A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u02b8\u0300-\u0590\u0800-\u1fff\u200e\u2c00-\ufb1c\ufe00-\ufe6f\ufefd-\uffff";
-goog.i18n.bidi.rtlChars_ = "\u0591-\u07ff\u200f\ufb1d-\ufdff\ufe70-\ufefc";
+goog.i18n.bidi.rtlChars_ = "\u0591-\u06ef\u06fa-\u07ff\u200f\ufb1d-\ufdff\ufe70-\ufefc";
 goog.i18n.bidi.htmlSkipReg_ = /<[^>]*>|&[^;]+;/g;
 goog.i18n.bidi.stripHtmlIfNeeded_ = function(str, opt_isStripNeeded) {
   return opt_isStripNeeded ? str.replace(goog.i18n.bidi.htmlSkipReg_, "") : str;
@@ -1830,7 +1839,7 @@ goog.i18n.bidi.normalizeHebrewQuote = function(str) {
   return str.replace(goog.i18n.bidi.doubleQuoteSubstituteRe_, "$1\u05f4").replace(goog.i18n.bidi.singleQuoteSubstituteRe_, "$1\u05f3");
 };
 goog.i18n.bidi.wordSeparatorRe_ = /\s+/;
-goog.i18n.bidi.hasNumeralsRe_ = /\d/;
+goog.i18n.bidi.hasNumeralsRe_ = /[\d\u06f0-\u06f9]/;
 goog.i18n.bidi.rtlDetectionThreshold_ = .4;
 goog.i18n.bidi.estimateDirection = function(str, opt_isHtml) {
   for (var rtlCount = 0, totalCount = 0, hasWeaklyLtr = !1, tokens = goog.i18n.bidi.stripHtmlIfNeeded_(str, opt_isHtml).split(goog.i18n.bidi.wordSeparatorRe_), i = 0;i < tokens.length;i++) {
@@ -6066,9 +6075,10 @@ goog.async.run.initializeRunner_ = function() {
     };
   }
 };
-goog.async.run.forceNextTick = function() {
+goog.async.run.forceNextTick = function(opt_realSetTimeout) {
   goog.async.run.schedule_ = function() {
     goog.async.nextTick(goog.async.run.processWorkQueue);
+    opt_realSetTimeout && opt_realSetTimeout(goog.async.run.processWorkQueue);
   };
 };
 goog.async.run.workQueueScheduled_ = !1;
@@ -7312,7 +7322,7 @@ goog.Uri.removeDotSegments = function(path) {
   return path;
 };
 goog.Uri.decodeOrEmpty_ = function(val, opt_preserveReserved) {
-  return val ? opt_preserveReserved ? decodeURI(val) : decodeURIComponent(val) : "";
+  return val ? opt_preserveReserved ? decodeURI(val.replace(/%25/g, "%2525")) : decodeURIComponent(val) : "";
 };
 goog.Uri.encodeSpecialChars_ = function(unescapedPart, extra, opt_removeDoubleEncoding) {
   if (goog.isString(unescapedPart)) {

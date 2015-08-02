@@ -65,6 +65,12 @@ correct value (e.g `gzip`).
 * pull (bool): Downloads any updates to the FROM image in Dockerfiles
 * forcerm (bool): Always remove intermediate containers, even after unsuccessful builds
 * dockerfile (str): path within the build context to the Dockerfile
+* container_limits (dict): A dictionary of limits applied to each container
+  created by the build process. Valid keys:
+    - memory (int): set memory limit for build
+    - memswap (int): Total memory (memory + swap), -1 to disable swap
+    - cpushares (int): CPU shares (relative weight)
+    - cpusetcpus (str): CPUs in which to allow exection, e.g., `"0-3"`, `"0,1"`
 
 **Returns** (generator): A generator of the build output
 
@@ -135,6 +141,10 @@ non-running ones
 non-running ones
 * limit (int): Show `limit` last created containers, include non-running ones
 * size (bool): Display sizes
+* filters (dict): Filters to be processed on the image list. Available filters:
+    - `exited` (int): Only containers with specified exit code
+    - `status` (str): One of `restarting`, `running`, `paused`, `exited`
+    - `label` (str): format either `"key"` or `"key=value"`
 
 **Returns** (dict): The system's containers
 
@@ -256,28 +266,58 @@ function return a blocking generator you can iterate over to retrieve events as 
 
 ## execute
 
-```python
-c.execute(container, cmd, detach=False, stdout=True, stderr=True,
-       stream=False, tty=False)
-```
+This command is deprecated for docker-py >= 1.2.0 ; use `exec_create` and
+`exec_start` instead.
 
-Execute a command in a running container.
+## exec_create
+
+Sets up an exec instance in a running container.
 
 **Params**:
 
-* container (str): can be a container dictionary (result of
-running `inspect_container`), unique id or container name.
+* container (str): Target container where exec instance will be created
+* cmd (str or list): Command to be executed
+* stdout (bool): Attach to stdout of the exec command if true. Default: True
+* stderr (bool): Attach to stderr of the exec command if true. Default: True
+* tty (bool): Allocate a pseudo-TTY. Default: False
+
+**Returns** (dict): A dictionary with an exec 'Id' key.
 
 
-* cmd (str or list): representing the command and its arguments.
+## exec_inspect
 
-* detach (bool): flag to `True` will run the process in the background.
+Return low-level information about an exec command.
 
-* stdout (bool): indicates which output streams to read from.
-* stderr (bool): indicates which output streams to read from.
+**Params**:
 
-* stream (bool): indicates whether to return a generator which will yield
-  the streaming response in chunks.
+* exec_id (str): ID of the exec instance
+
+**Returns** (dict): Dictionary of values returned by the endpoint.
+
+
+## exec_resize
+
+Resize the tty session used by the specified exec command.
+
+**Params**:
+
+* exec_id (str): ID of the exec instance
+* height (int): Height of tty session
+* width (int): Width of tty session
+
+## exec_start
+
+Start a previously set up exec instance.
+
+**Params**:
+
+* exec_id (str): ID of the exec instance
+* detach (bool): If true, detach from the exec command. Default: False
+* tty (bool): Allocate a pseudo-TTY. Default: False
+* stream (bool): Stream response data
+
+**Returns** (generator or str): If `stream=True`, a generator yielding response
+chunks. A string containing response data otherwise.
 
 ## export
 
@@ -325,11 +365,13 @@ List images. Identical to the `docker images` command.
 
 **Params**:
 
-* name (str): Optional filter for a name
+* name (str): Only show images belonging to the repository `name`
 * quiet (bool): Only show numeric Ids. Returns a list
 * all (bool): Show all images (by default filter out the intermediate image
 layers)
-* viz: *Depreciated*
+* filters (dict): Filters to be processed on the image list. Available filters:
+    - `dangling` (bool)
+    - `label` (str): format either `"key"` or `"key=value"`
 
 **Returns** (dict or list): A list if `quiet=True`, otherwise a dict.
 
@@ -345,19 +387,65 @@ layers)
 
 ## import_image
 
-Identical to the `docker import` command. If `src` is a string or unicode
-string, it will be treated as a URL to fetch the image from. To import an image
-from the local machine, `src` needs to be a file-like object or bytes
-collection.  To import from a tarball use your absolute path to your tarball.
-To load arbitrary data as tarball use whatever you want as src and your
-tarball content in data.
+Similar to the `docker import` command.
+
+If `src` is a string or unicode string, it will first be treated as a path to
+a tarball on the local system. If there is an error reading from that file,
+src will be treated as a URL instead to fetch the image from. You can also pass
+an open file handle as 'src', in which case the data will be read from that
+file.
+
+If `src` is unset but `image` is set, the `image` paramater will be taken as
+the name of an existing image to import from.
 
 **Params**:
 
-* src (str or file): Path to tarfile or URL
+* src (str or file): Path to tarfile, URL, or file-like object
 * repository (str): The repository to create
 * tag (str): The tag to apply
 * image (str): Use another image like the `FROM` Dockerfile parameter
+
+## import_image_from_data
+
+Like `.import_image()`, but allows importing in-memory bytes data.
+
+**Params**:
+
+* data (bytes collection): Bytes collection containing valid tar data
+* repository (str): The repository to create
+* tag (str): The tag to apply
+
+## import_image_from_file
+
+Like `.import_image()`, but only supports importing from a tar file on
+disk. If the file doesn't exist it will raise `IOError`.
+
+**Params**:
+
+* filename (str): Full path to a tar file.
+* repository (str): The repository to create
+* tag (str): The tag to apply
+
+## import_image_from_url
+
+Like `.import_image()`, but only supports importing from a URL.
+
+**Params**:
+
+* url (str): A URL pointing to a tar file.
+* repository (str): The repository to create
+* tag (str): The tag to apply
+
+## import_image_from_image
+
+Like `.import_image()`, but only supports importing from another image,
+like the `FROM` Dockerfile parameter.
+
+**Params**:
+
+* image (str): Image name to import from
+* repository (str): The repository to create
+* tag (str): The tag to apply
 
 ## info
 
@@ -502,6 +590,8 @@ Identical to the `docker pull` command.
 * tag (str): The tag to pull
 * stream (bool): Stream the output as a generator
 * insecure_registry (bool): Use an insecure registry
+* auth_config (dict): Override the credentials that Client.login has set for this request
+  `auth_config` should contain the `username` and `password` keys to be valid.
 
 **Returns** (generator or str): The output
 
@@ -700,6 +790,8 @@ from. Optionally a single string joining container id's with commas
 * extra_hosts (dict): custom host-to-IP mappings (host:ip)
 * pid_mode (str): if set to "host", use the host PID namespace inside the
   container
+* security_opt (list): A list of string values to customize labels for MLS systems, such as SELinux.
+* ulimits (list): A list of dicts or `docker.utils.Ulimit` objects.
 
 ```python
 >>> from docker import Client

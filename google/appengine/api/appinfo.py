@@ -576,7 +576,7 @@ _MAX_URL_LENGTH = 2047
 
 
 _CANNED_RUNTIMES = ('contrib-dart', 'dart', 'go', 'php', 'php55', 'python',
-                    'python27', 'java', 'java7', 'vm', 'custom')
+                    'python27', 'java', 'java7', 'vm', 'custom', 'nodejs')
 _all_runtimes = _CANNED_RUNTIMES
 _vm_runtimes = _CANNED_RUNTIMES
 

@@ -17,54 +17,57 @@ import os
 import re
 import shlex
 import struct
+import warnings
 from datetime import datetime
 
 import requests
 import requests.exceptions
 import six
 
+from . import constants
+from . import errors
 from .auth import auth
 from .unixconn import unixconn
 from .ssladapter import ssladapter
-from .utils import utils
-from . import errors
+from .utils import utils, check_resource
 from .tls import TLSConfig
 
 
 if not six.PY3:
     import websocket
 
-DEFAULT_DOCKER_API_VERSION = '1.18'
-DEFAULT_TIMEOUT_SECONDS = 60
-STREAM_HEADER_SIZE_BYTES = 8
-
 
 class Client(requests.Session):
     def __init__(self, base_url=None, version=None,
-                 timeout=DEFAULT_TIMEOUT_SECONDS, tls=False):
+                 timeout=constants.DEFAULT_TIMEOUT_SECONDS, tls=False):
         super(Client, self).__init__()
-        base_url = utils.parse_host(base_url)
-        if 'http+unix:///' in base_url:
-            base_url = base_url.replace('unix:/', 'unix:')
+
         if tls and not base_url.startswith('https://'):
             raise errors.TLSParameterError(
                 'If using TLS, the base_url argument must begin with '
                 '"https://".')
+
         self.base_url = base_url
         self.timeout = timeout
+
         self._auth_configs = auth.load_config()
 
-        # Use SSLAdapter for the ability to specify SSL version
-        if isinstance(tls, TLSConfig):
-            tls.configure_client(self)
-        elif tls:
-            self.mount('https://', ssladapter.SSLAdapter())
+        base_url = utils.parse_host(base_url)
+        if base_url.startswith('http+unix://'):
+            unix_socket_adapter = unixconn.UnixAdapter(base_url, timeout)
+            self.mount('http+docker://', unix_socket_adapter)
+            self.base_url = 'http+docker://localunixsocket'
         else:
-            self.mount('http+unix://', unixconn.UnixAdapter(base_url, timeout))
+            # Use SSLAdapter for the ability to specify SSL version
+            if isinstance(tls, TLSConfig):
+                tls.configure_client(self)
+            elif tls:
+                self.mount('https://', ssladapter.SSLAdapter())
+            self.base_url = base_url
 
         # version detection needs to be after unix adapter mounting
         if version is None:
-            self._version = DEFAULT_DOCKER_API_VERSION
+            self._version = constants.DEFAULT_DOCKER_API_VERSION
         elif isinstance(version, six.string_types):
             if version.lower() == 'auto':
                 self._version = self._retrieve_server_version()
@@ -149,6 +152,7 @@ class Client(requests.Session):
             'stream': 1
         }
 
+    @check_resource
     def _attach_websocket(self, container, params=None):
         if six.PY3:
             raise NotImplementedError("This method is not currently supported "
@@ -211,7 +215,7 @@ class Client(requests.Session):
             if len(buf[walker:]) < 8:
                 break
             _, length = struct.unpack_from('>BxxxL', buf[walker:])
-            start = walker + STREAM_HEADER_SIZE_BYTES
+            start = walker + constants.STREAM_HEADER_SIZE_BYTES
             end = start + length
             walker = end
             yield buf[start:end]
@@ -229,7 +233,7 @@ class Client(requests.Session):
             socket.settimeout(None)
 
         while True:
-            header = response.raw.read(STREAM_HEADER_SIZE_BYTES)
+            header = response.raw.read(constants.STREAM_HEADER_SIZE_BYTES)
             if not header:
                 break
             _, length = struct.unpack('>BxxxL', header)
@@ -244,6 +248,7 @@ class Client(requests.Session):
     def api_version(self):
         return self._version
 
+    @check_resource
     def attach(self, container, stdout=True, stderr=True,
                stream=False, logs=False):
         if isinstance(container, dict):
@@ -280,6 +285,7 @@ class Client(requests.Session):
                 [x for x in self._multiplexed_buffer_helper(response)]
             )
 
+    @check_resource
     def attach_socket(self, container, params=None, ws=False):
         if params is None:
             params = {
@@ -301,10 +307,17 @@ class Client(requests.Session):
     def build(self, path=None, tag=None, quiet=False, fileobj=None,
               nocache=False, rm=False, stream=False, timeout=None,
               custom_context=False, encoding=None, pull=True,
-              forcerm=False, dockerfile=None):
+              forcerm=False, dockerfile=None, container_limits=None):
         remote = context = headers = None
+        container_limits = container_limits or {}
         if path is None and fileobj is None:
             raise TypeError("Either path or fileobj needs to be provided.")
+
+        for key in container_limits.keys():
+            if key not in constants.CONTAINER_LIMITS_KEYS:
+                raise errors.DockerException(
+                    'Invalid container_limits key {0}'.format(key)
+                )
 
         if custom_context:
             if not fileobj:
@@ -348,8 +361,9 @@ class Client(requests.Session):
             'rm': rm,
             'forcerm': forcerm,
             'pull': pull,
-            'dockerfile': dockerfile
+            'dockerfile': dockerfile,
         }
+        params.update(container_limits)
 
         if context is not None:
             headers = {'Content-Type': 'application/tar'}
@@ -393,8 +407,11 @@ class Client(requests.Session):
                 return None, output
             return match.group(1), output
 
+    @check_resource
     def commit(self, container, repository=None, tag=None, message=None,
                author=None, conf=None):
+        if isinstance(container, dict):
+            container = container.get('Id')
         params = {
             'container': container,
             'repo': repository,
@@ -406,7 +423,7 @@ class Client(requests.Session):
         return self._result(self._post_json(u, data=conf, params=params),
                             json=True)
 
-    def containers(self, quiet=False, all=False, trunc=True, latest=False,
+    def containers(self, quiet=False, all=False, trunc=False, latest=False,
                    since=None, before=None, limit=-1, size=False,
                    filters=None):
         params = {
@@ -424,8 +441,12 @@ class Client(requests.Session):
 
         if quiet:
             return [{'Id': x['Id']} for x in res]
+        if trunc:
+            for x in res:
+                x['Id'] = x['Id'][:12]
         return res
 
+    @check_resource
     def copy(self, container, resource):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -444,7 +465,7 @@ class Client(requests.Session):
                          network_disabled=False, name=None, entrypoint=None,
                          cpu_shares=None, working_dir=None, domainname=None,
                          memswap_limit=0, cpuset=None, host_config=None,
-                         mac_address=None, labels=None, security_opt=None):
+                         mac_address=None, labels=None):
 
         if isinstance(volumes, six.string_types):
             volumes = [volumes, ]
@@ -458,8 +479,7 @@ class Client(requests.Session):
             self._version, image, command, hostname, user, detach, stdin_open,
             tty, mem_limit, ports, environment, dns, volumes, volumes_from,
             network_disabled, entrypoint, cpu_shares, working_dir, domainname,
-            memswap_limit, cpuset, host_config, mac_address, labels,
-            security_opt
+            memswap_limit, cpuset, host_config, mac_address, labels
         )
         return self.create_container_from_config(config, name)
 
@@ -471,6 +491,7 @@ class Client(requests.Session):
         res = self._post_json(u, data=config, params=params)
         return self._result(res, True)
 
+    @check_resource
     def diff(self, container):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -497,8 +518,20 @@ class Client(requests.Session):
                                             params=params, stream=True),
                                    decode=decode)
 
+    @check_resource
     def execute(self, container, cmd, detach=False, stdout=True, stderr=True,
                 stream=False, tty=False):
+        warnings.warn(
+            'Client.execute is being deprecated. Please use exec_create & '
+            'exec_start instead', DeprecationWarning
+        )
+        create_res = self.exec_create(
+            container, cmd, detach, stdout, stderr, tty
+        )
+
+        return self.exec_start(create_res, detach, tty, stream)
+
+    def exec_create(self, container, cmd, stdout=True, stderr=True, tty=False):
         if utils.compare_version('1.15', self._version) < 0:
             raise errors.InvalidVersion('Exec is not supported in API < 1.15')
         if isinstance(container, dict):
@@ -514,18 +547,44 @@ class Client(requests.Session):
             'AttachStdin': False,
             'AttachStdout': stdout,
             'AttachStderr': stderr,
-            'Detach': detach,
             'Cmd': cmd
         }
 
-        # create the command
         url = self._url('/containers/{0}/exec'.format(container))
         res = self._post_json(url, data=data)
+        return self._result(res, True)
+
+    def exec_inspect(self, exec_id):
+        if utils.compare_version('1.15', self._version) < 0:
+            raise errors.InvalidVersion('Exec is not supported in API < 1.15')
+        if isinstance(exec_id, dict):
+            exec_id = exec_id.get('Id')
+        res = self._get(self._url("/exec/{0}/json".format(exec_id)))
+        return self._result(res, True)
+
+    def exec_resize(self, exec_id, height=None, width=None):
+        if utils.compare_version('1.15', self._version) < 0:
+            raise errors.InvalidVersion('Exec is not supported in API < 1.15')
+        if isinstance(exec_id, dict):
+            exec_id = exec_id.get('Id')
+
+        params = {'h': height, 'w': width}
+        url = self._url("/exec/{0}/resize".format(exec_id))
+        res = self._post(url, params=params)
         self._raise_for_status(res)
 
-        # start the command
-        cmd_id = res.json().get('Id')
-        res = self._post_json(self._url('/exec/{0}/start'.format(cmd_id)),
+    def exec_start(self, exec_id, detach=False, tty=False, stream=False):
+        if utils.compare_version('1.15', self._version) < 0:
+            raise errors.InvalidVersion('Exec is not supported in API < 1.15')
+        if isinstance(exec_id, dict):
+            exec_id = exec_id.get('Id')
+
+        data = {
+            'Tty': tty,
+            'Detach': detach
+        }
+
+        res = self._post_json(self._url('/exec/{0}/start'.format(exec_id)),
                               data=data, stream=stream)
         self._raise_for_status(res)
         if stream:
@@ -539,6 +598,7 @@ class Client(requests.Session):
                 [x for x in self._multiplexed_buffer_helper(res)]
             )
 
+    @check_resource
     def export(self, container):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -547,12 +607,14 @@ class Client(requests.Session):
         self._raise_for_status(res)
         return res.raw
 
+    @check_resource
     def get_image(self, image):
         res = self._get(self._url("/images/{0}/get".format(image)),
                         stream=True)
         self._raise_for_status(res)
         return res.raw
 
+    @check_resource
     def history(self, image):
         res = self._get(self._url("/images/{0}/history".format(image)))
         return self._result(res, True)
@@ -577,50 +639,105 @@ class Client(requests.Session):
         return res
 
     def import_image(self, src=None, repository=None, tag=None, image=None):
+        if src:
+            if isinstance(src, six.string_types):
+                try:
+                    result = self.import_image_from_file(
+                        src, repository=repository, tag=tag)
+                except IOError:
+                    result = self.import_image_from_url(
+                        src, repository=repository, tag=tag)
+            else:
+                result = self.import_image_from_data(
+                    src, repository=repository, tag=tag)
+        elif image:
+            result = self.import_image_from_image(
+                image, repository=repository, tag=tag)
+        else:
+            raise Exception("Must specify a src or image")
+
+        return result
+
+    def import_image_from_data(self, data, repository=None, tag=None):
         u = self._url("/images/create")
         params = {
+            'fromSrc': '-',
             'repo': repository,
             'tag': tag
         }
+        headers = {
+            'Content-Type': 'application/tar',
+        }
+        return self._result(
+            self._post(u, data=data, params=params, headers=headers))
 
-        if src:
-            try:
-                # XXX: this is ways not optimal but the only way
-                # for now to import tarballs through the API
-                fic = open(src)
-                data = fic.read()
-                fic.close()
-                src = "-"
-            except IOError:
-                # file does not exists or not a file (URL)
-                data = None
-            if isinstance(src, six.string_types):
-                params['fromSrc'] = src
-                return self._result(self._post(u, data=data, params=params))
-            return self._result(self._post(u, data=src, params=params))
+    def import_image_from_file(self, filename, repository=None, tag=None):
+        u = self._url("/images/create")
+        params = {
+            'fromSrc': '-',
+            'repo': repository,
+            'tag': tag
+        }
+        headers = {
+            'Content-Type': 'application/tar',
+        }
+        with open(filename, 'rb') as f:
+            return self._result(
+                self._post(u, data=f, params=params, headers=headers,
+                           timeout=None))
 
-        if image:
-            params['fromImage'] = image
-            return self._result(self._post(u, data=None, params=params))
+    def import_image_from_stream(self, stream, repository=None, tag=None):
+        u = self._url("/images/create")
+        params = {
+            'fromSrc': '-',
+            'repo': repository,
+            'tag': tag
+        }
+        headers = {
+            'Content-Type': 'application/tar',
+            'Transfer-Encoding': 'chunked',
+        }
+        return self._result(
+            self._post(u, data=stream, params=params, headers=headers))
 
-        raise Exception("Must specify a src or image")
+    def import_image_from_url(self, url, repository=None, tag=None):
+        u = self._url("/images/create")
+        params = {
+            'fromSrc': url,
+            'repo': repository,
+            'tag': tag
+        }
+        return self._result(
+            self._post(u, data=None, params=params))
+
+    def import_image_from_image(self, image, repository=None, tag=None):
+        u = self._url("/images/create")
+        params = {
+            'fromImage': image,
+            'repo': repository,
+            'tag': tag
+        }
+        return self._result(
+            self._post(u, data=None, params=params))
 
     def info(self):
         return self._result(self._get(self._url("/info")),
                             True)
 
+    @check_resource
     def insert(self, image, url, path):
         if utils.compare_version('1.12', self._version) >= 0:
             raise errors.DeprecatedMethod(
                 'insert is not available for API version >=1.12'
             )
-        api_url = self._url("/images/" + image + "/insert")
+        api_url = self._url("/images/{0}/insert".fornat(image))
         params = {
             'url': url,
             'path': path
         }
         return self._result(self._post(api_url, params=params))
 
+    @check_resource
     def inspect_container(self, container):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -628,12 +745,14 @@ class Client(requests.Session):
             self._get(self._url("/containers/{0}/json".format(container))),
             True)
 
-    def inspect_image(self, image_id):
+    @check_resource
+    def inspect_image(self, image):
         return self._result(
-            self._get(self._url("/images/{0}/json".format(image_id))),
+            self._get(self._url("/images/{0}/json".format(image))),
             True
         )
 
+    @check_resource
     def kill(self, container, signal=None):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -681,6 +800,7 @@ class Client(requests.Session):
             self._auth_configs[registry] = req_data
         return self._result(response, json=True)
 
+    @check_resource
     def logs(self, container, stdout=True, stderr=True, stream=False,
              timestamps=False, tail='all'):
         if isinstance(container, dict):
@@ -715,6 +835,7 @@ class Client(requests.Session):
             logs=True
         )
 
+    @check_resource
     def pause(self, container):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -725,6 +846,7 @@ class Client(requests.Session):
     def ping(self):
         return self._result(self._get(self._url('/_ping')))
 
+    @check_resource
     def port(self, container, private_port):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -747,7 +869,7 @@ class Client(requests.Session):
         return h_ports
 
     def pull(self, repository, tag=None, stream=False,
-             insecure_registry=False):
+             insecure_registry=False, auth_config=None):
         if not tag:
             repository, tag = utils.parse_repository_tag(repository)
         registry, repo_name = auth.resolve_repository_name(
@@ -765,15 +887,21 @@ class Client(requests.Session):
         if utils.compare_version('1.5', self._version) >= 0:
             # If we don't have any auth data so far, try reloading the config
             # file one more time in case anything showed up in there.
-            if not self._auth_configs:
-                self._auth_configs = auth.load_config()
-            authcfg = auth.resolve_authconfig(self._auth_configs, registry)
-
-            # Do not fail here if no authentication exists for this specific
-            # registry as we can have a readonly pull. Just put the header if
-            # we can.
-            if authcfg:
-                headers['X-Registry-Auth'] = auth.encode_header(authcfg)
+            if auth_config is None:
+                if not self._auth_configs:
+                    self._auth_configs = auth.load_config()
+                authcfg = auth.resolve_authconfig(self._auth_configs, registry)
+                # Do not fail here if no authentication exists for this
+                # specific registry as we can have a readonly pull. Just
+                # put the header if we can.
+                if authcfg:
+                    # auth_config needs to be a dict in the format used by
+                    # auth.py username , password, serveraddress, email
+                    headers['X-Registry-Auth'] = auth.encode_header(
+                        authcfg
+                    )
+            else:
+                headers['X-Registry-Auth'] = auth.encode_header(auth_config)
 
         response = self._post(self._url('/images/create'), params=params,
                               headers=headers, stream=stream, timeout=None)
@@ -817,6 +945,7 @@ class Client(requests.Session):
         return stream and self._stream_helper(response) \
             or self._result(response)
 
+    @check_resource
     def remove_container(self, container, v=False, link=False, force=False):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -825,6 +954,7 @@ class Client(requests.Session):
                            params=params)
         self._raise_for_status(res)
 
+    @check_resource
     def remove_image(self, image, force=False, noprune=False):
         if isinstance(image, dict):
             image = image.get('Id')
@@ -832,6 +962,7 @@ class Client(requests.Session):
         res = self._delete(self._url("/images/" + image), params=params)
         self._raise_for_status(res)
 
+    @check_resource
     def rename(self, container, name):
         if utils.compare_version('1.17', self._version) < 0:
             raise errors.InvalidVersion(
@@ -844,6 +975,7 @@ class Client(requests.Session):
         res = self._post(url, params=params)
         self._raise_for_status(res)
 
+    @check_resource
     def resize(self, container, height, width):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -853,6 +985,7 @@ class Client(requests.Session):
         res = self._post(url, params=params)
         self._raise_for_status(res)
 
+    @check_resource
     def restart(self, container, timeout=10):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -866,12 +999,13 @@ class Client(requests.Session):
                                       params={'term': term}),
                             True)
 
+    @check_resource
     def start(self, container, binds=None, port_bindings=None, lxc_conf=None,
               publish_all_ports=False, links=None, privileged=False,
               dns=None, dns_search=None, volumes_from=None, network_mode=None,
               restart_policy=None, cap_add=None, cap_drop=None, devices=None,
-              extra_hosts=None, read_only=None, pid_mode=None,
-              security_opt=None):
+              extra_hosts=None, read_only=None, pid_mode=None, ipc_mode=None,
+              security_opt=None, ulimits=None):
 
         if utils.compare_version('1.10', self._version) < 0:
             if dns is not None:
@@ -881,6 +1015,16 @@ class Client(requests.Session):
             if volumes_from is not None:
                 raise errors.InvalidVersion(
                     'volumes_from is only supported for API version >= 1.10'
+                )
+
+        if utils.compare_version('1.15', self._version) < 0:
+            if security_opt is not None:
+                raise errors.InvalidVersion(
+                    'security_opt is only supported for API version >= 1.15'
+                )
+            if ipc_mode:
+                raise errors.InvalidVersion(
+                    'ipc_mode is only supported for API version >= 1.15'
                 )
 
         if utils.compare_version('1.17', self._version) < 0:
@@ -893,6 +1037,12 @@ class Client(requests.Session):
                     'pid_mode is only supported for API version >= 1.17'
                 )
 
+        if utils.compare_version('1.18', self._version) < 0:
+            if ulimits is not None:
+                raise errors.InvalidVersion(
+                    'ulimits is only supported for API version >= 1.18'
+                )
+
         start_config = utils.create_host_config(
             binds=binds, port_bindings=port_bindings, lxc_conf=lxc_conf,
             publish_all_ports=publish_all_ports, links=links, dns=dns,
@@ -900,7 +1050,7 @@ class Client(requests.Session):
             cap_drop=cap_drop, volumes_from=volumes_from, devices=devices,
             network_mode=network_mode, restart_policy=restart_policy,
             extra_hosts=extra_hosts, read_only=read_only, pid_mode=pid_mode,
-            security_opt=security_opt
+            ipc_mode=ipc_mode, security_opt=security_opt, ulimits=ulimits
         )
 
         if isinstance(container, dict):
@@ -912,6 +1062,7 @@ class Client(requests.Session):
         res = self._post_json(url, data=start_config)
         self._raise_for_status(res)
 
+    @check_resource
     def stats(self, container, decode=None):
         if utils.compare_version('1.17', self._version) < 0:
             raise errors.InvalidVersion(
@@ -922,6 +1073,7 @@ class Client(requests.Session):
         url = self._url("/containers/{0}/stats".format(container))
         return self._stream_helper(self._get(url, stream=True), decode=decode)
 
+    @check_resource
     def stop(self, container, timeout=10):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -932,6 +1084,7 @@ class Client(requests.Session):
                          timeout=(timeout + self.timeout))
         self._raise_for_status(res)
 
+    @check_resource
     def tag(self, image, repository, tag=None, force=False):
         params = {
             'tag': tag,
@@ -943,7 +1096,10 @@ class Client(requests.Session):
         self._raise_for_status(res)
         return res.status_code == 201
 
+    @check_resource
     def top(self, container):
+        if isinstance(container, dict):
+            container = container.get('Id')
         u = self._url("/containers/{0}/top".format(container))
         return self._result(self._get(u), True)
 
@@ -951,6 +1107,7 @@ class Client(requests.Session):
         url = self._url("/version", versioned_api=api_version)
         return self._result(self._get(url), json=True)
 
+    @check_resource
     def unpause(self, container):
         if isinstance(container, dict):
             container = container.get('Id')
@@ -958,6 +1115,7 @@ class Client(requests.Session):
         res = self._post(url)
         self._raise_for_status(res)
 
+    @check_resource
     def wait(self, container, timeout=None):
         if isinstance(container, dict):
             container = container.get('Id')

@@ -12,25 +12,31 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-import time
 import base64
+import contextlib
 import json
 import io
 import os
 import shutil
 import signal
+import socket
+import tarfile
 import tempfile
+import threading
+import time
 import unittest
 import warnings
 
 import docker
 import six
 
+from six.moves import BaseHTTPServer
+from six.moves import socketserver
+
 from test import Cleanup
 
 # FIXME: missing tests for
-# export; history; import_image; insert; port; push; tag; get; load; stats;
-
+# export; history; insert; port; push; tag; get; load; stats
 DEFAULT_BASE_URL = os.environ.get('DOCKER_HOST')
 EXEC_DRIVER_IS_NATIVE = True
 
@@ -311,6 +317,60 @@ class TestStartContainerWithRoBinds(BaseTestCase):
         self.assertIn('VolumesRW', inspect_data)
         self.assertIn(mount_dest, inspect_data['VolumesRW'])
         self.assertFalse(inspect_data['VolumesRW'][mount_dest])
+
+
+class TestStartContainerWithFileBind(BaseTestCase):
+    def runTest(self):
+        mount_dest = '/myfile/myfile'
+        mount_origin = tempfile.mktemp()
+        try:
+            binds = {
+                mount_origin: {
+                    'bind': mount_dest,
+                    'ro': True
+                },
+            }
+
+            with open(mount_origin, 'w') as f:
+                f.write('sakuya izayoi')
+
+            container = self.client.create_container(
+                'busybox', ['cat', mount_dest], volumes={mount_dest: {}}
+            )
+            self.client.start(container, binds=binds)
+            exitcode = self.client.wait(container)
+            self.assertEqual(exitcode, 0)
+            logs = self.client.logs(container)
+            if six.PY3:
+                logs = logs.decode('utf-8')
+            self.assertIn('sakuya izayoi', logs)
+        finally:
+            os.unlink(mount_origin)
+
+
+class TestCreateContainerWithLogConfig(BaseTestCase):
+    def runTest(self):
+        config = docker.utils.LogConfig(
+            type=docker.utils.LogConfig.types.SYSLOG,
+            config={'key1': 'val1'}
+        )
+        ctnr = self.client.create_container(
+            'busybox', ['true'],
+            host_config=create_host_config(log_config=config)
+        )
+        self.assertIn('Id', ctnr)
+        self.tmp_containers.append(ctnr['Id'])
+        self.client.start(ctnr)
+        info = self.client.inspect_container(ctnr)
+        self.assertIn('HostConfig', info)
+        host_config = info['HostConfig']
+        self.assertIn('LogConfig', host_config)
+        log_config = host_config['LogConfig']
+        self.assertIn('Type', log_config)
+        self.assertEqual(log_config['Type'], config.type)
+        self.assertIn('Config', log_config)
+        self.assertEqual(type(log_config['Config']), dict)
+        self.assertEqual(log_config['Config'], config.config)
 
 
 @unittest.skipIf(not EXEC_DRIVER_IS_NATIVE, 'Exec driver not native')
@@ -921,6 +981,19 @@ class TestStartContainerWithVolumesFrom(BaseTestCase):
         self.assertCountEqual(info['HostConfig']['VolumesFrom'], vol_names)
 
 
+class TestStartContainerWithUlimits(BaseTestCase):
+    def runTest(self):
+        ulimit = docker.utils.Ulimit(name='nofile', soft=4096, hard=4096)
+
+        res0 = self.client.create_container('busybox', 'true')
+        container1_id = res0['Id']
+        self.tmp_containers.append(container1_id)
+        self.client.start(container1_id, ulimits=[ulimit])
+
+        info = self.client.inspect_container(container1_id)
+        self.assertCountEqual(info['HostConfig']['Ulimits'], [ulimit])
+
+
 class TestStartContainerWithLinks(BaseTestCase):
     def runTest(self):
         res0 = self.client.create_container(
@@ -998,9 +1071,12 @@ class TestExecuteCommand(BaseTestCase):
         self.client.start(id)
         self.tmp_containers.append(id)
 
-        res = self.client.execute(id, ['echo', 'hello'])
+        res = self.client.exec_create(id, ['echo', 'hello'])
+        self.assertIn('Id', res)
+
+        exec_log = self.client.exec_start(res)
         expected = b'hello\n' if six.PY3 else 'hello\n'
-        self.assertEqual(res, expected)
+        self.assertEqual(exec_log, expected)
 
 
 @unittest.skipIf(not EXEC_DRIVER_IS_NATIVE, 'Exec driver not native')
@@ -1012,9 +1088,12 @@ class TestExecuteCommandString(BaseTestCase):
         self.client.start(id)
         self.tmp_containers.append(id)
 
-        res = self.client.execute(id, 'echo hello world', stdout=True)
+        res = self.client.exec_create(id, 'echo hello world')
+        self.assertIn('Id', res)
+
+        exec_log = self.client.exec_start(res)
         expected = b'hello world\n' if six.PY3 else 'hello world\n'
-        self.assertEqual(res, expected)
+        self.assertEqual(exec_log, expected)
 
 
 @unittest.skipIf(not EXEC_DRIVER_IS_NATIVE, 'Exec driver not native')
@@ -1026,12 +1105,31 @@ class TestExecuteCommandStreaming(BaseTestCase):
         self.client.start(id)
         self.tmp_containers.append(id)
 
-        chunks = self.client.execute(id, ['echo', 'hello\nworld'], stream=True)
+        exec_id = self.client.exec_create(id, ['echo', 'hello\nworld'])
+        self.assertIn('Id', exec_id)
+
         res = b'' if six.PY3 else ''
-        for chunk in chunks:
+        for chunk in self.client.exec_start(exec_id, stream=True):
             res += chunk
         expected = b'hello\nworld\n' if six.PY3 else 'hello\nworld\n'
         self.assertEqual(res, expected)
+
+
+@unittest.skipIf(not EXEC_DRIVER_IS_NATIVE, 'Exec driver not native')
+class TestExecInspect(BaseTestCase):
+    def runTest(self):
+        container = self.client.create_container('busybox', 'cat',
+                                                 detach=True, stdin_open=True)
+        id = container['Id']
+        self.client.start(id)
+        self.tmp_containers.append(id)
+
+        exec_id = self.client.exec_create(id, ['mkdir', '/does/not/exist'])
+        self.assertIn('Id', exec_id)
+        self.client.exec_start(exec_id)
+        exec_info = self.client.exec_inspect(exec_id)
+        self.assertIn('ExitCode', exec_info)
+        self.assertNotEqual(exec_info['ExitCode'], 0)
 
 
 class TestRunContainerStreaming(BaseTestCase):
@@ -1228,6 +1326,157 @@ class TestRemoveImage(BaseTestCase):
         images = self.client.images(all=True)
         res = [x for x in images if x['Id'].startswith(img_id)]
         self.assertEqual(len(res), 0)
+
+
+##################
+#  IMPORT TESTS  #
+##################
+
+
+class ImportTestCase(BaseTestCase):
+    '''Base class for `docker import` test cases.'''
+
+    # Use a large file size to increase the chance of triggering any
+    # MemoryError exceptions we might hit.
+    TAR_SIZE = 512 * 1024 * 1024
+
+    def write_dummy_tar_content(self, n_bytes, tar_fd):
+        def extend_file(f, n_bytes):
+            f.seek(n_bytes - 1)
+            f.write(bytearray([65]))
+            f.seek(0)
+
+        tar = tarfile.TarFile(fileobj=tar_fd, mode='w')
+
+        with tempfile.NamedTemporaryFile() as f:
+            extend_file(f, n_bytes)
+            tarinfo = tar.gettarinfo(name=f.name, arcname='testdata')
+            tar.addfile(tarinfo, fileobj=f)
+
+        tar.close()
+
+    @contextlib.contextmanager
+    def dummy_tar_stream(self, n_bytes):
+        '''Yields a stream that is valid tar data of size n_bytes.'''
+        with tempfile.NamedTemporaryFile() as tar_file:
+            self.write_dummy_tar_content(n_bytes, tar_file)
+            tar_file.seek(0)
+            yield tar_file
+
+    @contextlib.contextmanager
+    def dummy_tar_file(self, n_bytes):
+        '''Yields the name of a valid tar file of size n_bytes.'''
+        with tempfile.NamedTemporaryFile() as tar_file:
+            self.write_dummy_tar_content(n_bytes, tar_file)
+            tar_file.seek(0)
+            yield tar_file.name
+
+
+class TestImportFromBytes(ImportTestCase):
+    '''Tests importing an image from in-memory byte data.'''
+
+    def runTest(self):
+        with self.dummy_tar_stream(n_bytes=500) as f:
+            content = f.read()
+
+        # The generic import_image() function cannot import in-memory bytes
+        # data that happens to be represented as a string type, because
+        # import_image() will try to use it as a filename and usually then
+        # trigger an exception. So we test the import_image_from_data()
+        # function instead.
+        statuses = self.client.import_image_from_data(
+            content, repository='test/import-from-bytes')
+
+        result_text = statuses.splitlines()[-1]
+        result = json.loads(result_text)
+
+        self.assertNotIn('error', result)
+
+        img_id = result['status']
+        self.tmp_imgs.append(img_id)
+
+
+class TestImportFromFile(ImportTestCase):
+    '''Tests importing an image from a tar file on disk.'''
+
+    def runTest(self):
+        with self.dummy_tar_file(n_bytes=self.TAR_SIZE) as tar_filename:
+            # statuses = self.client.import_image(
+            #     src=tar_filename, repository='test/import-from-file')
+            statuses = self.client.import_image_from_file(
+                tar_filename, repository='test/import-from-file')
+
+        result_text = statuses.splitlines()[-1]
+        result = json.loads(result_text)
+
+        self.assertNotIn('error', result)
+
+        self.assertIn('status', result)
+        img_id = result['status']
+        self.tmp_imgs.append(img_id)
+
+
+class TestImportFromStream(ImportTestCase):
+    '''Tests importing an image from a stream containing tar data.'''
+
+    def runTest(self):
+        with self.dummy_tar_stream(n_bytes=self.TAR_SIZE) as tar_stream:
+            statuses = self.client.import_image(
+                src=tar_stream, repository='test/import-from-stream')
+            # statuses = self.client.import_image_from_stream(
+            #     tar_stream, repository='test/import-from-stream')
+        result_text = statuses.splitlines()[-1]
+        result = json.loads(result_text)
+
+        self.assertNotIn('error', result)
+
+        self.assertIn('status', result)
+        img_id = result['status']
+        self.tmp_imgs.append(img_id)
+
+
+class TestImportFromURL(ImportTestCase):
+    '''Tests downloading an image over HTTP.'''
+
+    @contextlib.contextmanager
+    def temporary_http_file_server(self, stream):
+        '''Serve data from an IO stream over HTTP.'''
+
+        class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/x-tar')
+                self.end_headers()
+                shutil.copyfileobj(stream, self.wfile)
+
+        server = socketserver.TCPServer(('', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.setDaemon(True)
+        thread.start()
+
+        yield 'http://%s:%s' % (socket.gethostname(), server.server_address[1])
+
+        server.shutdown()
+
+    def runTest(self):
+        # The crappy test HTTP server doesn't handle large files well, so use
+        # a small file.
+        TAR_SIZE = 10240
+
+        with self.dummy_tar_stream(n_bytes=TAR_SIZE) as tar_data:
+            with self.temporary_http_file_server(tar_data) as url:
+                statuses = self.client.import_image(
+                    src=url, repository='test/import-from-url')
+
+        result_text = statuses.splitlines()[-1]
+        result = json.loads(result_text)
+
+        self.assertNotIn('error', result)
+
+        self.assertIn('status', result)
+        img_id = result['status']
+        self.tmp_imgs.append(img_id)
+
 
 #################
 # BUILDER TESTS #
@@ -1482,10 +1731,7 @@ class UnixconnTestCase(unittest.TestCase):
 # REGRESSION TESTS #
 ####################
 
-class TestRegressions(unittest.TestCase):
-    def setUp(self):
-        self.client = docker.Client(timeout=5, base_url=DEFAULT_BASE_URL)
-
+class TestRegressions(BaseTestCase):
     def test_443(self):
         dfile = io.BytesIO()
         with self.assertRaises(docker.errors.APIError) as exc:
@@ -1493,6 +1739,13 @@ class TestRegressions(unittest.TestCase):
                 pass
         self.assertEqual(exc.exception.response.status_code, 500)
         dfile.close()
+
+    def test_542(self):
+        self.client.start(
+            self.client.create_container('busybox', ['true'])
+        )
+        result = self.client.containers(trunc=True)
+        self.assertEqual(len(result[0]['Id']), 12)
 
 
 if __name__ == '__main__':
